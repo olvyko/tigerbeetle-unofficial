@@ -29,6 +29,7 @@ fn target_to_lib_dir(target: &str) -> Option<&'static str> {
         "x86_64-unknown-linux-musl" => Some("x86_64-linux-musl"),
         "x86_64-apple-darwin" => Some("x86_64-macos"),
         "x86_64-pc-windows-gnu" => Some("x86_64-windows"),
+        "x86_64-pc-windows-msvc" => Some("x86_64-windows"),
         _ => None,
     }
 }
@@ -42,6 +43,7 @@ fn target_to_tigerbeetle_target(target: &str) -> Option<&'static str> {
         "x86_64-unknown-linux-musl" => Some("x86_64-linux-musl"),
         "x86_64-apple-darwin" => Some("x86_64-macos"),
         "x86_64-pc-windows-gnu" => Some("x86_64-windows"),
+        "x86_64-pc-windows-msvc" => Some("x86_64-windows"),
         _ => None,
     }
 }
@@ -86,6 +88,10 @@ fn main() {
                 .into_iter()
                 .collect(),
         );
+
+        if cfg!(windows) {
+            cleanup_zig_windows_install(&tigerbeetle_root);
+        }
 
         let status = if cfg!(windows) {
             let mut cmd = Command::new("pwsh");
@@ -132,22 +138,60 @@ fn main() {
             // `-gnu` toolchain looks for `lib<name>.a` file of a static library by default, but
             // `zig build` produces `<name>.lib` despite using MinGW under-the-hood.
             println!("cargo:rustc-link-lib=static:+verbatim=tb_client.lib");
-            // As of Rust 1.87, its `std` doesn't link `advapi32` automatically anymore, however
-            // the `tb_client` requires it.
-            // See: https://github.com/rust-lang/rust/pull/138233
-            //      https://github.com/rust-lang/rust/issues/139352
-            println!("cargo:rustc-link-lib=advapi32");
         } else {
             println!("cargo:rustc-link-lib=static=tb_client");
         }
 
+        // if cfg!(windows) {
+        //     // As of Rust 1.87, its `std` doesn't link `advapi32` automatically anymore, however
+        //     // the `tb_client` requires it.
+        //     // See: https://github.com/rust-lang/rust/pull/138233
+        //     //      https://github.com/rust-lang/rust/issues/139352
+        //     println!("cargo:rustc-link-lib=advapi32");
+        // }
+
         wrapper = c_dir.join("wrapper.h");
         let generated_header = c_dir.join("tb_client.h");
+
+        fn normalize_header(s: String) -> String {
+            // Make comparisons stable across platforms/editors.
+            s.replace("\r\n", "\n").replace('\r', "\n")
+        }
+
+        let pregenerated = {
+            let candidate_path = Path::new("src/tb_client.h");
+            let candidate =
+                fs::read_to_string(candidate_path).expect("reading pre-generated `tb_client.h`");
+
+            // On Windows, git often checks out symlinks as a plain text file containing the
+            // symlink target (when `core.symlinks=false` and/or Developer Mode is off).
+            // In that case, follow the target.
+            if candidate.contains("#ifndef TB_CLIENT_H") {
+                normalize_header(candidate)
+            } else {
+                let link_target = Path::new(candidate.trim());
+                let resolved = candidate_path
+                    .parent()
+                    .expect("`src/tb_client.h` should have a parent")
+                    .join(link_target);
+                normalize_header(
+                    fs::read_to_string(&resolved)
+                        .unwrap_or_else(|_| panic!(
+                            "reading `tb_client.h` symlink target at {resolved:?} (from {candidate_path:?})"
+                        )),
+                )
+            }
+        };
+
         assert_eq!(
-            fs::read_to_string(&generated_header).expect("reading generated `tb_client.h`"),
-            fs::read_to_string("src/tb_client.h")
-                .expect("reading pre-generated `tb_client.h`")
-                .replace("\r\n", "\n"),
+            // fs::read_to_string(&generated_header).expect("reading generated `tb_client.h`"),
+            // fs::read_to_string("src/tb_client.h")
+            //     .expect("reading pre-generated `tb_client.h`")
+            //     .replace("\r\n", "\n"),
+            normalize_header(
+                fs::read_to_string(&generated_header).expect("reading generated `tb_client.h`"),
+            ),
+            pregenerated,
             "generated and pre-generated `tb_client.h` headers must be equal, \
              generated at: {generated_header:?}",
         );
@@ -186,6 +230,41 @@ fn main() {
         drop(f);
 
         rustfmt(generated_path);
+    }
+}
+
+fn cleanup_zig_windows_install(tigerbeetle_root: &Path) {
+    // `zig/download.win.ps1` uses `Move-Item` without `-Force` for several files.
+    // If this build script runs multiple times (incremental builds, retries after failure,
+    // parallel builds), the destination files may already exist and the script will fail.
+    // Make the download step idempotent by removing the known destinations and any leftover
+    // extracted zig directories/archives.
+    let zig_dir = tigerbeetle_root.join("zig");
+
+    for rel in [
+        "doc",
+        "lib",
+        "LICENSE",
+        "README.md",
+        &format!("zig{}", env::consts::EXE_SUFFIX),
+    ] {
+        let path = zig_dir.join(rel);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    if let Ok(entries) = fs::read_dir(tigerbeetle_root) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+
+            // Leftover zig archives / extracted directories from a previous failed run.
+            if file_name.starts_with("zig-") && file_name.contains("-windows-") {
+                let path = entry.path();
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
     }
 }
 
